@@ -1,114 +1,204 @@
 import pandas as pd
+import math
+import ta
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 import yfinance as yf
+import pandas_datareader as pdr
+import plotly.express as px
 from datetime import datetime
+from pandas_datareader.data import DataReader
 from sklearn.preprocessing import MinMaxScaler
 from keras.models import Sequential
-from keras.layers import Dense, LSTM
-import math
+from keras.layers import Dense, LSTM, Dropout, Bidirectional, Input
+from keras.callbacks import EarlyStopping
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import tensorflow as tf
+from keras.optimizers import Adam
 
-# download data 
-def download_data(tickers, start, end):
-    data_dict = {ticker: yf.download(ticker, start, end) for ticker in tickers}
-    return data_dict
 
-# plot historical closing prices 
-def plot_closing_prices(data_dict):
-    n = len(data_dict)
-    cols = 2
+sns.set_style('whitegrid')
+plt.style.use("fivethirtyeight")
+%matplotlib inline
+
+ticker_input = input("Enter tickers by comma separated: ")
+ticker_list = [t.strip().upper() for t in ticker_input.split(',')]
+
+name_input = input("Enter company names by comma separated: ")
+org_names = [n.strip() for n in name_input.split(',')]
+print(ticker_list, org_names)
+
+end_date = datetime.now()
+start_date = datetime(end_date.year-1, end_date.month, end_date.day)
+
+company_data = []
+
+for ticker, org in zip(ticker_list, org_names):
+    df = yf.download(ticker, start=start_date, end=end_date)
+
+    df["Company"] = org
+    df["Ticker"] = ticker
+
+    company_data.append(df)
+
+df_all = pd.concat(company_data, axis=0)
+
+df_all.to_csv("all_input_companies_df.csv", index=True)
+
+for ticker, org, data in zip(ticker_list, org_names, company_data):
+    filename = f"{ticker}_{org}.csv"
+    data.to_csv(filename, index=True)
+
+print(df_all.head())
+
+for ticker, data in zip(ticker_list, company_data):
+    print(ticker)
+    print(data.describe())
+    print(data.info())
+    print("\n")
+
+def make_grid(n, cols=2):
+    cols = 1 if n == 1 else cols
     rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(nrows=rows, ncols=cols, figsize=(15, 5*rows))
+    fig, axes = plt.subplots(rows, cols, figsize=(20 * cols, 15 * rows), squeeze=False)
+    return fig, axes, rows, cols
 
-    axes = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
+# historical view of closing price
+fig, axes, rows, cols = make_grid(len(company_data), cols=2)
+for i, (ticker, data) in enumerate(zip(ticker_list, company_data)):
+    ax = axes[i // cols][i % cols]
+    data["Close"].plot(ax=ax)
+    ax.set_title(f"Closing Price of {ticker}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Close")
 
-    for ax, (ticker, df) in zip(axes, data_dict.items()):
-        df['Close'].plot(ax=ax, title=f"Closing Price of {ticker}")
-        ax.set_ylabel("Close")
+# hide any unused axes
+for j in range(i + 1, rows * cols):
+    fig.delaxes(axes[j // cols][j % cols])
 
-    for ax in axes[len(data_dict):]:
-        ax.set_visible(False)
+fig.tight_layout()
+plt.show()
 
-    plt.tight_layout()
-    plt.show()
+# daily return graph
+fig, axes, rows, cols = make_grid(len(company_data), cols=2)
+for i, (ticker, data) in enumerate(zip(ticker_list, company_data)):
+    ax = axes[i // cols][i % cols]
+    daily_ret = data["Close"].pct_change()
+    ax.plot(daily_ret.index, daily_ret, alpha=0.7)
+    ax.set_title(f"Daily Returns Over Time: {ticker}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Daily Return")
+fig.tight_layout()
+plt.show()
 
-# add moving averages
-def add_moving_averages(data_dict, ma_days=[10,20,50]):
-    for ma in ma_days:
-        for ticker, df in data_dict.items():
-            df[f"MA_{ma}"] = df['Close'].rolling(ma).mean()
-    return data_dict
+# closing price
+df = yf.download(ticker_list, start=start_date, end=datetime.now())
+# print(df)
+plt.figure(figsize=(20,10))
+plt.title('Close Price History')
+plt.plot(df['Close'])
+plt.xlabel('Date', fontsize=18)
+plt.ylabel('Close Price USD ($)', fontsize=18)
+plt.show()
 
-# prepare training data
-def prepare_data(ticker, start="2012-01-01"):
-    df = yf.download(ticker, start=start, end=datetime.now())
-    data = df[['Close']]
-    dataset = data.values
-    training_data_len = int(np.ceil(len(dataset) * 0.95))
+# prediction
+start_date = "2020-01-01"
+end_date = datetime.now()
+look_back = 90
+forecast_horizon = 7
 
-    scaler = MinMaxScaler(feature_range=(0,1))
-    scaled_data = scaler.fit_transform(dataset)
+df_multi = yf.download(ticker_list, start=start_date, end=end_date)
 
-    train_data = scaled_data[:training_data_len]
-    x_train, y_train = [], []
-    for i in range(60, len(train_data)):
-        x_train.append(train_data[i-60:i, 0])
-        y_train.append(train_data[i, 0])
-    x_train, y_train = np.array(x_train), np.array(y_train)
-    x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
+all_results = []
 
-    return df, dataset, training_data_len, scaler, x_train, y_train
+for ticker in ticker_list:
+    print(f"=== Processing {ticker} ===")
 
-# build lstm 
-def build_lstm(input_shape):
-    model = Sequential()
-    model.add(LSTM(128, return_sequences=True, input_shape=input_shape))
-    model.add(LSTM(64, return_sequences=False))
-    model.add(Dense(25))
-    model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mean_squared_error')
-    return model
+    # ----- isolate, ticker dataframe -----
+    df = df_multi.loc[: ,(slice(None), ticker)]
+    df.columns = df.columns.droplevel(1)
+    df = df.dropna()
 
-# plot results
-def predict_and_plot(df, dataset, training_data_len, scaler, model, ticker):
-    test_data = scaler.transform(dataset[training_data_len-60:])
-    x_test = []
-    for i in range(60, len(test_data)):
-        x_test.append(test_data[i-60:i, 0])
-    x_test = np.array(x_test).reshape(-1, 60, 1)
+    # ----- features -----
+    features = ['Open', 'High', 'Low', 'Close', 'Volume']
+    X_raw = df[features].values
+    y_raw = df[['Close']].values
 
-    predictions = model.predict(x_test)
-    predictions = scaler.inverse_transform(predictions)
+    # ----- scaling -----
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    X_scaled = scaler_X.fit_transform(X_raw)
+    y_scaled = scaler_y.fit_transform(y_raw)
 
-    train = df[:training_data_len]
-    valid = df[training_data_len:].copy()
-    valid['Predictions'] = predictions
+    # ----- sequences -----
+    X, y = [], []
+    for i in range(look_back, len(df)):
+        X.append(X_scaled[i - look_back:i :])
+        y.append(y_scaled[i, 0])
 
-    plt.figure(figsize=(16,6))
-    plt.title(f'{ticker} Prediction')
-    plt.plot(train['Close'], label='Train')
-    plt.plot(valid['Close'], label='Validation')
-    plt.plot(valid['Predictions'], label='Predictions')
-    plt.legend()
-    plt.show()
+    X = np.array(X)
+    y = np.array(y)
 
-if __name__ == "__main__":
-    tickers_input = input("Enter stock tickers separated by commas")
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    # ----- train split -----
+    split = int(len(X) * 0.8)
+    X_train, X_valid = X[:split], X[split:]
+    y_train, y_valid = y[:split], y[split:]
 
-    end = datetime.now()
-    start = datetime(end.year - 1, end.month, end.day)
-    data_dict = download_data(tickers, start, end)
+    if len(X_valid) == 0:
+        print(f"Skipping {ticker}, not enough data.")
+        continue
 
-    plot_closing_prices(data_dict)
+    # ----- model -----
+    model = Sequential([
+        Input(shape=(X_train.shape[1], X_train.shape[2])),
+        Bidirectional(LSTM(64, return_sequences=True)),
+        Dropout(0.2),
+        LSTM(32, return_sequences=True),
+        Dropout(0.2),
+        LSTM(16),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='huber')
 
-    data_dict = add_moving_averages(data_dict)
+    early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
-    for ticker in tickers:
-        print(f"\nRunning prediction model for {ticker}...")
-        df, dataset, training_data_len, scaler, x_train, y_train = prepare_data(ticker)
+    history = model.fit(
+        X_train, y_train,
+        epochs=50,
+        batch_size=32,
+        validation_data=(X_valid, y_valid),
+        callbacks=[early_stop],
+        verbose=0
+    )
 
-        model = build_lstm((x_train.shape[1], 1))
-        model.fit(x_train, y_train, batch_size=32, epochs=20, verbose=0)
+    # ----- prediction -----
+    y_pred_scaled = model.predict(X_valid, verbose=0)
+    y_pred = scaler_y.inverse_transform(y_pred_scaled).ravel()
+    y_true = scaler_y.inverse_transform(y_valid.reshape(-1,1)).ravel()
 
-        predict_and_plot(df, dataset, training_data_len, scaler, model, ticker)
+    valid_index = df.index[look_back + split:]
+    train_close = df['Close'].iloc[:look_back + split]
+
+    valid_df = pd.DataFrame(
+        {f'{ticker}_Actual': y_true, f'{ticker}_Predicted': y_pred},
+        index=valid_index
+    )
+    all_results.append(valid_df)
+
+    # ----- plot actual vs prediction -----
+    plt.figure(figsize=(14,6))
+    plt.plot(train_close, label='Train')
+    plt.plot(valid_df[f'{ticker}_Actual'], label='Actual', color='green')
+    plt.plot(valid_df[f'{ticker}_Predicted'], label='Prediction', color='red')
+    plt.title(f'{ticker} Stock Price Prediction')
+    plt.xlabel('Date'); plt.ylabel('Price USD')
+    plt.legend(); plt.show()
+
+    if all_results:
+      final_results = pd.concat(all_results, axis=1)
+      print("\n--- Final Results (Last 10 Days) ---")
+      pd.set_option("display.max_columns", None)
+      print(final_results.tail(10))
+    else:
+      print("\nNo results to display.")
